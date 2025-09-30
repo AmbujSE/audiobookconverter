@@ -3,12 +3,16 @@ import subprocess
 import json
 from pathlib import Path
 import re
+from typing import Optional
 
 class AudiobookConverter:
     def __init__(self, folder_path, output_folder=None):
         self.folder_path = Path(folder_path)
         self.output_folder = Path(output_folder) if output_folder else self.folder_path / "converted_mp3"
         self.output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Common image formats for album artwork
+        self.image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
         
     def check_ffmpeg(self):
         """Check if FFmpeg is installed"""
@@ -42,6 +46,46 @@ class AudiobookConverter:
             print(f"Warning: Could not parse CUE file {cue_path}: {e}")
         
         return chapters
+    
+    def find_album_artwork(self, m4b_path):
+        """Find album artwork file with the same name as the M4B file"""
+        m4b_path = Path(m4b_path)
+        base_name = m4b_path.stem
+        
+        # Look for image files with the same base name
+        for ext in self.image_extensions:
+            artwork_path = m4b_path.parent / f"{base_name}{ext}"
+            if artwork_path.exists():
+                print(f"Found external artwork: {artwork_path.name}")
+                return str(artwork_path)
+        
+        # Look for common cover art names in the same directory
+        common_names = ['cover', 'folder', 'albumart', 'front', 'artwork']
+        for name in common_names:
+            for ext in self.image_extensions:
+                artwork_path = m4b_path.parent / f"{name}{ext}"
+                if artwork_path.exists():
+                    print(f"Found common artwork file: {artwork_path.name}")
+                    return str(artwork_path)
+        
+        return None
+    
+    def has_embedded_artwork(self, m4b_path):
+        """Check if the M4B file has embedded artwork"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'csv=p=0',
+                str(m4b_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            # If there's a video stream, it's likely embedded artwork
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
     
     def get_metadata(self, m4b_path):
         """Extract metadata from m4b file using ffprobe"""
@@ -77,12 +121,32 @@ class AudiobookConverter:
         # Get metadata from m4b
         metadata = self.get_metadata(m4b_path)
         
+        # Find external artwork
+        external_artwork = self.find_album_artwork(m4b_path)
+        has_embedded_art = self.has_embedded_artwork(m4b_path)
+        
         # Build FFmpeg command
         cmd = ['ffmpeg', '-i', str(m4b_path)]
         
+        # Add external artwork as input if found
+        if external_artwork:
+            cmd.extend(['-i', external_artwork])
+        
         # Add metadata mapping
         cmd.extend(['-map', '0:a'])  # Map audio stream
-        cmd.extend(['-map_metadata', '0'])  # Copy all metadata
+        cmd.extend(['-map_metadata', '0'])  # Copy all metadata from audio file
+        
+        # Handle artwork mapping
+        if external_artwork:
+            cmd.extend(['-map', '1:v'])  # Map video/image stream from second input (external artwork)
+            cmd.extend(['-c:v', 'copy'])  # Copy video stream without re-encoding
+            cmd.extend(['-disposition:v:0', 'attached_pic'])  # Mark as attached picture
+            print(f"Adding external artwork: {Path(external_artwork).name}")
+        elif has_embedded_art:
+            cmd.extend(['-map', '0:v'])  # Map embedded artwork
+            cmd.extend(['-c:v', 'copy'])  # Copy video stream without re-encoding
+            cmd.extend(['-disposition:v:0', 'attached_pic'])  # Mark as attached picture
+            print("Preserving embedded artwork from M4B file")
         
         # Check if chapters exist in the m4b file
         has_chapters = False
@@ -115,6 +179,10 @@ class AudiobookConverter:
                 for key in ['title', 'artist', 'album', 'date', 'genre']:
                     if key in tags:
                         print(f"    {key.capitalize()}: {tags[key]}")
+            
+            # Display artwork info
+            if external_artwork or has_embedded_art:
+                print(f"  ✓ Album artwork included")
             
             return True
         except subprocess.CalledProcessError as e:
